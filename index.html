@@ -95,7 +95,6 @@
       bottom: max(16px, calc(env(safe-area-inset-bottom, 16px) + 4px));
       z-index: 30;
     }
-    /* Hide horizontal scrollbar on route cards */
     .no-scrollbar::-webkit-scrollbar { display: none; }
     .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
   </style>
@@ -106,7 +105,7 @@
   <script type="text/babel">
     const { useState, useEffect, useRef, useMemo } = React;
 
-    // --- 0. PERSISTENCE ENGINE (IndexedDB + LocalStorage + JSON Snapshot) ---
+    // --- 0. PERSISTENCE ENGINE (IndexedDB + LocalStorage with Order Preservation) ---
     const DB_NAME = 'VeloLabProDB_v2';
     const STORE_ROUTES = 'routes';
     const STORE_SETTINGS = 'settings';
@@ -132,13 +131,19 @@
     async function saveStateToStorage(routesList, riderSettings, activeRouteId, tileKey) {
       try {
         const db = await openDB();
-        const tx = db.transaction([STORE_ROUTES, STORE_SETTINGS], 'readwrite');
-        const rStore = tx.objectStore(STORE_ROUTES);
-        rStore.clear();
-        routesList.forEach(r => rStore.put(r));
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction([STORE_ROUTES, STORE_SETTINGS], 'readwrite');
+          const rStore = tx.objectStore(STORE_ROUTES);
+          rStore.clear();
+          // Save orderIndex so IndexedDB doesn't reshuffle routes alphabetically on reload
+          routesList.forEach((r, idx) => rStore.put({ ...r, orderIndex: idx }));
 
-        const sStore = tx.objectStore(STORE_SETTINGS);
-        sStore.put({ key: 'prefs', rider: riderSettings, activeId: activeRouteId, tileKey });
+          const sStore = tx.objectStore(STORE_SETTINGS);
+          sStore.put({ key: 'prefs', rider: riderSettings, activeId: activeRouteId, tileKey });
+
+          tx.oncomplete = () => resolve(true);
+          tx.onerror = () => reject(tx.error);
+        });
         return true;
       } catch (e) {
         try {
@@ -156,7 +161,12 @@
         const db = await openDB();
         const routes = await new Promise((res) => {
           const req = db.transaction(STORE_ROUTES, 'readonly').objectStore(STORE_ROUTES).getAll();
-          req.onsuccess = () => res(req.result || []);
+          req.onsuccess = () => {
+            const list = req.result || [];
+            // Restore exact user order
+            list.sort((a, b) => (a.orderIndex ?? 999) - (b.orderIndex ?? 999));
+            res(list);
+          };
           req.onerror = () => res([]);
         });
         const prefs = await new Promise((res) => {
@@ -164,17 +174,17 @@
           req.onsuccess = () => res(req.result || null);
           req.onerror = () => res(null);
         });
-        if (routes.length > 0 || prefs) return { routes, prefs, persistent: true };
+        if (routes.length > 0 || prefs) return { routes, prefs };
       } catch (e) {
         try {
           const r = JSON.parse(localStorage.getItem('velolab_routes') || '[]');
           const p = JSON.parse(localStorage.getItem('velolab_prefs') || 'null');
-          return { routes: r, prefs: p, persistent: true };
+          return { routes: r, prefs: p };
         } catch (err) {
-          return { routes: [], prefs: null, persistent: false };
+          return { routes: [], prefs: null };
         }
       }
-      return { routes: [], prefs: null, persistent: true };
+      return { routes: [], prefs: null };
     }
 
     // --- 1. CYCLING PHYSICS, SAVITZKY-GOLAY & FIETS CLIMB ENGINE ---
@@ -423,6 +433,7 @@
       const [hoverIdx, setHoverIdx] = useState(null);
       const [rider, setRider] = useState({ riderWeight: 74, bikeWeight: 8.2, ftp: 260, cda: 0.31, crr: 0.004 });
       const [isStorageReady, setIsStorageReady] = useState(false);
+      const [mapReady, setMapReady] = useState(false);
 
       const mapContainerRef = useRef(null);
       const mapRef = useRef(null);
@@ -430,19 +441,32 @@
       const routeLayerGroupRef = useRef(null);
       const puckRef = useRef(null);
       const fileInputRef = useRef(null);
+      const activeRouteCardRef = useRef(null);
 
-      // Load saved routes & rider physics from IndexedDB on startup
+      // 1. Load saved routes & rider physics from IndexedDB on startup
       useEffect(() => {
         loadStateFromStorage().then(({ routes: savedRoutes, prefs }) => {
-          if (savedRoutes && savedRoutes.length > 0) setRawRoutes(savedRoutes);
+          if (savedRoutes && savedRoutes.length > 0) {
+            setRawRoutes(savedRoutes);
+            const targetId = prefs?.activeId && savedRoutes.some(r => r.id === prefs.activeId)
+              ? prefs.activeId
+              : savedRoutes[0].id;
+            setActiveId(targetId);
+          } else if (prefs?.activeId) {
+            setActiveId(prefs.activeId);
+          }
           if (prefs?.rider) setRider(prefs.rider);
-          if (prefs?.activeId) setActiveId(prefs.activeId);
-          if (prefs?.tileKey) setTileKey(prefs.tileKey);
+          if (prefs?.tileKey && TILE_SOURCES[prefs.tileKey]) {
+            setTileKey(prefs.tileKey);
+            if (tileLayerRef.current) {
+              tileLayerRef.current.setUrl(TILE_SOURCES[prefs.tileKey].url);
+            }
+          }
           setIsStorageReady(true);
         });
       }, []);
 
-      // Automatically save to IndexedDB whenever routes or physics change
+      // 2. Automatically save to IndexedDB whenever routes or physics change
       useEffect(() => {
         if (!isStorageReady) return;
         saveStateToStorage(rawRoutes, rider, activeId, tileKey);
@@ -451,13 +475,14 @@
       const routes = useMemo(() => rawRoutes.map(r => analyzeRoute(r.id, r.name, r.rawPoints, rider)).filter(Boolean), [rawRoutes, rider]);
       const activeRoute = useMemo(() => routes.find(r => r.id === activeId) || routes[0], [routes, activeId]);
 
+      // 3. Initialize Leaflet Map & signal mapReady when ready
       useEffect(() => {
         if (!mapContainerRef.current || mapRef.current || !window.L) return;
 
         const L = window.L;
         const map = L.map(mapContainerRef.current, {
           center: [51.22, -0.33],
-          zoom: 12,
+          zoom: 11,
           zoomControl: false,
           attributionControl: false
         });
@@ -468,14 +493,8 @@
 
         setTimeout(() => {
           map.invalidateSize();
-          drawRoutesOnLeaflet();
-          if (activeRoute) {
-            map.fitBounds(activeRoute.bounds, {
-              paddingTopLeft: [25, 195],
-              paddingBottomRight: [25, 240]
-            });
-          }
-        }, 150);
+          setMapReady(true);
+        }, 120);
       }, []);
 
       const cycleMapStyle = () => {
@@ -498,7 +517,7 @@
         routes.forEach(r => {
           if (activeRoute && r.id === activeRoute.id) return;
           const latlngs = r.points.map(p => [p.lat, p.lon]);
-          const poly = L.polyline(latlngs, { color: r.toughnessColor, weight: 3.5, opacity: 0.7 });
+          const poly = L.polyline(latlngs, { color: r.toughnessColor, weight: 3.5, opacity: 0.72 });
           poly.on('click', () => setActiveId(r.id));
           poly.addTo(group);
         });
@@ -534,9 +553,10 @@
         }
       };
 
+      // 4. Redraw routes & fit bounds whenever mapReady, Storage, or activeRoute updates
       useEffect(() => {
         const map = mapRef.current;
-        if (!map) return;
+        if (!map || !mapReady) return;
         map.invalidateSize();
         drawRoutesOnLeaflet();
         if (activeRoute) {
@@ -546,7 +566,11 @@
             animate: true
           });
         }
-      }, [routes, activeRoute, drawerOpen]);
+        // Scroll active route card into view in top carousel
+        if (activeRouteCardRef.current) {
+          activeRouteCardRef.current.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+        }
+      }, [routes, activeRoute, drawerOpen, mapReady, isStorageReady]);
 
       useEffect(() => {
         const map = mapRef.current;
@@ -624,9 +648,8 @@
 
           <input ref={fileInputRef} type="file" accept=".gpx,.json,*/*" multiple className="hidden" onChange={onUploadGpx} />
 
-          {/* UNIFIED TOP SAFE-AREA DOCK (Buttons + Route Cards Stacked Cleanly Without Overlap) */}
+          {/* UNIFIED TOP SAFE-AREA DOCK */}
           <div className="ios-top-dock">
-            {/* Row 1: Top Controls */}
             <div className="flex items-center justify-between gap-1.5 pointer-events-auto">
               <div className="flex items-center gap-1.5">
                 <button
@@ -667,44 +690,47 @@
               </div>
             </div>
 
-            {/* Row 2: Horizontal Route Selector Cards (Zero Overlap) */}
             {drawerOpen && (
               <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar pointer-events-auto">
-                {routes.map(r => (
-                  <div
-                    key={r.id}
-                    onClick={() => setActiveId(r.id)}
-                    className={`shrink-0 w-64 p-2.5 rounded-2xl backdrop-blur-xl border transition cursor-pointer ${
-                      activeRoute?.id === r.id ? 'bg-slate-950/95 border-cyan-400 shadow-xl' : 'bg-slate-950/85 border-slate-800'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-1">
-                      <span className="text-xs font-bold text-white truncate">{r.name}</span>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <span
-                          className="px-1.5 py-0.5 rounded text-[10px] font-black text-slate-950"
-                          style={{ backgroundColor: r.toughnessColor }}
-                        >
-                          {r.toughnessScore.toFixed(1)}/10
-                        </span>
-                        {routes.length > 1 && (
-                          <button
-                            onClick={(e) => deleteRoute(r.id, e)}
-                            className="text-slate-500 hover:text-rose-400 text-xs px-1 font-bold"
+                {routes.map(r => {
+                  const isActive = activeRoute?.id === r.id;
+                  return (
+                    <div
+                      key={r.id}
+                      ref={isActive ? activeRouteCardRef : null}
+                      onClick={() => setActiveId(r.id)}
+                      className={`shrink-0 w-64 p-2.5 rounded-2xl backdrop-blur-xl border transition cursor-pointer ${
+                        isActive ? 'bg-slate-950/95 border-cyan-400 shadow-xl' : 'bg-slate-950/85 border-slate-800'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="text-xs font-bold text-white truncate">{r.name}</span>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <span
+                            className="px-1.5 py-0.5 rounded text-[10px] font-black text-slate-950"
+                            style={{ backgroundColor: r.toughnessColor }}
                           >
-                            ✕
-                          </button>
-                        )}
+                            {r.toughnessScore.toFixed(1)}/10
+                          </span>
+                          {routes.length > 1 && (
+                            <button
+                              onClick={(e) => deleteRoute(r.id, e)}
+                              className="text-slate-500 hover:text-rose-400 text-xs px-1 font-bold"
+                            >
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-between text-[11px] text-slate-300 mt-1.5">
+                        <span>{r.distKm} km</span>
+                        <span className="text-emerald-400 font-bold">{r.gainM}m ↑</span>
+                        <span className="text-cyan-300 font-bold">{formatTime(r.movingTimeSec)}</span>
+                        <span className="text-amber-400 font-bold">{r.avgSpeedKmh} km/h</span>
                       </div>
                     </div>
-                    <div className="flex items-center justify-between text-[11px] text-slate-300 mt-1.5">
-                      <span>{r.distKm} km</span>
-                      <span className="text-emerald-400 font-bold">{r.gainM}m ↑</span>
-                      <span className="text-cyan-300 font-bold">{formatTime(r.movingTimeSec)}</span>
-                      <span className="text-amber-400 font-bold">{r.avgSpeedKmh} km/h</span>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
