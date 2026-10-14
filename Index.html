@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="referrer" content="no-referrer" />
+  <title>VeloLab Pro</title>
+
+  <!-- iPhone Safari Standalone PWA Meta Tags -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="VeloLab Pro" />
+  <meta name="theme-color" content="#090D16" />
+  <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/2972/2972185.png" />
+
+  <!-- Leaflet JS & CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React 18 UMD + Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    html, body, #root {
+      width: 100vw;
+      height: 100dvh;
+      margin: 0;
+      padding: 0;
+      background-color: #090D16;
+      overflow: hidden;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
+    }
+    #map-wrapper {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      width: 100vw; height: 100dvh;
+      z-index: 1;
+      background: #111827;
+      perspective: 1200px;
+    }
+    #map-canvas {
+      width: 100vw !important;
+      height: 100dvh !important;
+      background: #111827;
+      transition: transform 0.4s ease;
+    }
+    .leaflet-container img,
+    .leaflet-tile-pane img,
+    img.leaflet-tile {
+      max-width: none !important;
+      max-height: none !important;
+      width: 256px !important;
+      height: 256px !important;
+      padding: 0 !important;
+      margin: 0 !important;
+    }
+    .leaflet-pane { z-index: 2; }
+    .leaflet-tile-pane { z-index: 1; }
+    .leaflet-overlay-pane { z-index: 4; }
+    .leaflet-marker-pane { z-index: 6; }
+    .map-tilted { transform: scale(1.16) rotateX(26deg); }
+    .leaflet-control-attribution { display: none !important; }
+    .safe-top { top: max(12px, env(safe-area-inset-top)); }
+    .safe-bottom { bottom: max(10px, env(safe-area-inset-bottom)); }
+  </style>
+</head>
+<body class="bg-[#090D16] text-slate-100">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useMemo } = React;
+
+    // --- 0. PERSISTENCE ENGINE (IndexedDB + LocalStorage + JSON Snapshot Fallback) ---
+    const DB_NAME = 'VeloLabProDB_v2';
+    const STORE_ROUTES = 'routes';
+    const STORE_SETTINGS = 'settings';
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        try {
+          if (!window.indexedDB) return reject(new Error('No IDB'));
+          const req = window.indexedDB.open(DB_NAME, 1);
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains(STORE_ROUTES)) db.createObjectStore(STORE_ROUTES, { keyPath: 'id' });
+            if (!db.objectStoreNames.contains(STORE_SETTINGS)) db.createObjectStore(STORE_SETTINGS, { keyPath: 'key' });
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        } catch (err) {
+          reject(err);
+        }
+      });
+    }
+
+    async function saveStateToStorage(routesList, riderSettings, activeRouteId, tileKey) {
+      try {
+        const db = await openDB();
+        const tx = db.transaction([STORE_ROUTES, STORE_SETTINGS], 'readwrite');
+        const rStore = tx.objectStore(STORE_ROUTES);
+        rStore.clear();
+        routesList.forEach(r => rStore.put(r));
+
+        const sStore = tx.objectStore(STORE_SETTINGS);
+        sStore.put({ key: 'prefs', rider: riderSettings, activeId: activeRouteId, tileKey });
+        return true;
+      } catch (e) {
+        try {
+          localStorage.setItem('velolab_prefs', JSON.stringify({ rider: riderSettings, activeId: activeRouteId, tileKey }));
+          localStorage.setItem('velolab_routes', JSON.stringify(routesList));
+          return true;
+        } catch (err) {
+          return false;
+        }
+      }
+    }
+
+    async function loadStateFromStorage() {
+      try {
+        const db = await openDB();
+        const routes = await new Promise((res) => {
+          const req = db.transaction(STORE_ROUTES, 'readonly').objectStore(STORE_ROUTES).getAll();
+          req.onsuccess = () => res(req.result || []);
+          req.onerror = () => res([]);
+        });
+        const prefs = await new Promise((res) => {
+          const req = db.transaction(STORE_SETTINGS, 'readonly').objectStore(STORE_SETTINGS).get('prefs');
+          req.onsuccess = () => res(req.result || null);
+          req.onerror = () => res(null);
+        });
+        if (routes.length > 0 || prefs) return { routes, prefs, persistent: true };
+      } catch (e) {
+        try {
+          const r = JSON.parse(localStorage.getItem('velolab_routes') || '[]');
+          const p = JSON.parse(localStorage.getItem('velolab_prefs') || 'null');
+          return { routes: r, prefs: p, persistent: true };
+        } catch (err) {
+          return { routes: [], prefs: null, persistent: false };
+        }
+      }
+      return { routes: [], prefs: null, persistent: true };
+    }
+
+    // --- 1. CYCLING PHYSICS, SAVITZKY-GOLAY & FIETS CLIMB ENGINE ---
+    const TOUGHNESS_TIERS = [
+      { max: 2.5, label: 'Recovery Spin', color: '#06B6D4' },
+      { max: 4.5, label: 'Tempo Endurance', color: '#10B981' },
+      { max: 6.5, label: 'Gran Fondo', color: '#F59E0B' },
+      { max: 8.4, label: 'Queen Stage', color: '#F97316' },
+      { max: 10.1, label: 'HC Monument', color: '#E11D48' },
+    ];
+
+    const TILE_SOURCES = {
+      terrain: { label: 'Terrain', url: 'https://mt1.google.com/vt/lyrs=p&x={x}&y={y}&z={z}' },
+      roads: { label: 'Roads', url: 'https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}' },
+      sat: { label: 'Sat', url: 'https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}' },
+      topo: { label: 'Topo', url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}' }
+    };
+
+    function getToughnessTier(score) {
+      return TOUGHNESS_TIERS.find(t => score <= t.max) || TOUGHNESS_TIERS[4];
+    }
+
+    function getGradeColor(g) {
+      if (g < 2) return '#10B981';
+      if (g < 5) return '#EAB308';
+      if (g < 8) return '#F97316';
+      if (g < 11) return '#EF4444';
+      return '#A855F7';
+    }
+
+    function formatTime(sec) {
+      const h = Math.floor(sec / 3600);
+      const m = Math.round((sec % 3600) / 60);
+      return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    }
+
+    function haversineM(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const toRad = d => (d * Math.PI) / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    function smoothElevations(eles) {
+      if (eles.length < 5) return [...eles];
+      return eles.map((_, i) => {
+        const e0 = eles[Math.max(0, i - 2)];
+        const e1 = eles[Math.max(0, i - 1)];
+        const e2 = eles[i];
+        const e3 = eles[Math.min(eles.length - 1, i + 1)];
+        const e4 = eles[Math.min(eles.length - 1, i + 2)];
+        return (e0 + 2 * e1 + 4 * e2 + 2 * e3 + e4) / 10;
+      });
+    }
+
+    function solveVelocityMS(powerW, gradePct, altM, rider) {
+      const m = rider.riderWeight + rider.bikeWeight;
+      const g = 9.80665;
+      const theta = Math.atan(gradePct / 100);
+      const rho = 1.225 * Math.exp(-Math.max(0, altM) / 8500);
+      const fGrav = m * g * Math.sin(theta);
+      const fRoll = m * g * Math.cos(theta) * rider.crr;
+      const aero = 0.5 * rho * rider.cda;
+      let v = gradePct > 5 ? 4.2 : 9.0;
+      const pWheel = Math.max(15, powerW * 0.97);
+      for (let i = 0; i < 14; i++) {
+        const f = aero * v * v * v + (fGrav + fRoll) * v - pWheel;
+        const df = 3 * aero * v * v + (fGrav + fRoll);
+        if (Math.abs(df) < 1e-5) break;
+        v = Math.max(1.4, Math.min(23.0, v - f / df));
+      }
+      return v;
+    }
+
+    function analyzeRoute(id, name, rawPoints, rider) {
+      if (!rawPoints || rawPoints.length < 2) return null;
+      const eles = smoothElevations(rawPoints.map(p => p.ele || 0));
+      const points = [];
+      let totalDistM = 0, gainM = 0, lossM = 0, lastEle = eles[0];
+      let minEle = eles[0], maxEle = eles[0];
+      let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+
+      for (let i = 0; i < rawPoints.length; i++) {
+        const pt = rawPoints[i];
+        const ele = eles[i];
+        const segM = i > 0 ? haversineM(rawPoints[i - 1].lat, rawPoints[i - 1].lon, pt.lat, pt.lon) : 0;
+        totalDistM += segM;
+        const diff = ele - lastEle;
+        if (Math.abs(diff) >= 1.5) {
+          if (diff > 0) gainM += diff;
+          else lossM += Math.abs(diff);
+          lastEle = ele;
+        }
+        minEle = Math.min(minEle, ele);
+        maxEle = Math.max(maxEle, ele);
+        minLat = Math.min(minLat, pt.lat);
+        maxLat = Math.max(maxLat, pt.lat);
+        minLon = Math.min(minLon, pt.lon);
+        maxLon = Math.max(maxLon, pt.lon);
+
+        points.push({ lat: pt.lat, lon: pt.lon, ele: Math.round(ele), distM: totalDistM, distKm: totalDistM / 1000, segM, grade: 0, speedKmh: 0, powerW: 0 });
+      }
+
+      let steepDistM = 0, maxGrade = 0, totalSec = 0, weightedPowerSum = 0, totalWorkJoules = 0;
+      for (let i = 0; i < points.length; i++) {
+        let j = Math.max(0, i - 3), k = Math.min(points.length - 1, i + 3);
+        const dM = points[k].distM - points[j].distM;
+        const dE = points[k].ele - points[j].ele;
+        const g = dM > 10 ? Math.max(-20, Math.min(24, (dE / dM) * 100)) : 0;
+        points[i].grade = Math.round(g * 10) / 10;
+        if (g > 8) steepDistM += points[i].segM;
+        if (g > maxGrade) maxGrade = g;
+
+        const factor = g >= 8 ? 0.96 : g >= 4 ? 0.86 : g <= -3 ? 0.15 : 0.72;
+        const pW = Math.round(rider.ftp * factor);
+        const vMS = solveVelocityMS(pW, g, points[i].ele, rider);
+        points[i].speedKmh = Math.round(vMS * 3.6 * 10) / 10;
+        points[i].powerW = pW;
+        if (i > 0 && points[i].segM > 0) {
+          const dt = points[i].segM / vMS;
+          totalSec += dt;
+          totalWorkJoules += pW * dt;
+          weightedPowerSum += Math.pow(pW, 4) * dt;
+        }
+      }
+
+      const climbs = [];
+      let inClimb = false, sIdx = 0, dropM = 0;
+      for (let i = 1; i < points.length; i++) {
+        if (!inClimb && points[i].grade >= 3.0) { inClimb = true; sIdx = i - 1; dropM = 0; }
+        else if (inClimb) {
+          dropM = points[i].grade < 1.5 ? dropM + points[i].segM : 0;
+          if (dropM > 350 || i === points.length - 1) {
+            const lenM = points[i].distM - points[sIdx].distM;
+            const cGain = points[i].ele - points[sIdx].ele;
+            if (lenM >= 500 && cGain >= 35) {
+              const avgG = (cGain / lenM) * 100;
+              const fiets = (cGain * cGain) / (lenM * 10) + (points[i].ele > 1000 ? (points[i].ele - 1000) / 1000 : 0);
+              const cat = fiets >= 6.5 ? 'HC' : fiets >= 4.5 ? 'Cat 1' : fiets >= 2.5 ? 'Cat 2' : fiets >= 1.2 ? 'Cat 3' : fiets >= 0.45 ? 'Cat 4' : null;
+              if (cat) {
+                climbs.push({
+                  id: `${id}-c-${climbs.length}`,
+                  category: cat,
+                  fiets: Math.round(fiets * 10) / 10,
+                  lengthKm: Math.round((lenM / 1000) * 10) / 10,
+                  avgGrade: Math.round(avgG * 10) / 10,
+                  summitLat: points[i].lat,
+                  summitLon: points[i].lon,
+                  summitEle: points[i].ele
+                });
+              }
+            }
+            inClimb = false;
+          }
+        }
+      }
+
+      const distKm = totalDistM / 1000;
+      const fietsSum = climbs.reduce((s, c) => s + c.fiets, 0);
+      const rawScore = distKm * 0.032 + gainM / 270 + (steepDistM / Math.max(1, totalDistM)) * 14 + fietsSum * 0.22;
+      const toughnessScore = Math.max(1.0, Math.min(10.0, Math.round(rawScore * 10) / 10));
+      const tier = getToughnessTier(toughnessScore);
+
+      const avgSpeedKmh = totalSec > 0 ? Math.round((distKm / (totalSec / 3600)) * 10) / 10 : 25;
+      const np = totalSec > 0 ? Math.round(Math.pow(weightedPowerSum / totalSec, 0.25)) : Math.round(rider.ftp * 0.78);
+      const intensityFactor = Math.round((np / rider.ftp) * 100) / 100;
+      const tss = Math.round(((totalSec * np * intensityFactor) / (rider.ftp * 3600)) * 100);
+      const kj = Math.round(totalWorkJoules / 1000);
+      const minGear = maxGrade >= 14 ? '34×34T' : maxGrade >= 10 ? '34×32T' : maxGrade >= 8 ? '36×30T' : '36×28T';
+
+      return {
+        id, name, points,
+        distKm: Math.round(distKm * 10) / 10,
+        gainM: Math.round(gainM),
+        minEle: Math.round(minEle),
+        maxEle: Math.round(maxEle),
+        maxGrade: Math.round(maxGrade * 10) / 10,
+        toughnessScore,
+        toughnessLabel: tier.label,
+        toughnessColor: tier.color,
+        climbs,
+        bounds: [[minLat, minLon], [maxLat, maxLon]],
+        movingTimeSec: Math.round(totalSec),
+        avgSpeedKmh, np, intensityFactor, tss, kj, minGear
+      };
+    }
+
+    function createPreloadedRoutes() {
+      const makeTrack = (anchors) => {
+        const pts = [];
+        for (let i = 0; i < anchors.length - 1; i++) {
+          const [lat1, lon1, e1] = anchors[i];
+          const [lat2, lon2, e2] = anchors[i + 1];
+          for (let s = 0; s < 22; s++) {
+            const t = s / 22;
+            const w = Math.sin(t * Math.PI * 2) * 0.0007;
+            pts.push({
+              lat: lat1 + (lat2 - lat1) * t + w,
+              lon: lon1 + (lon2 - lon1) * t - w,
+              ele: e1 + (e2 - e1) * (0.5 - 0.5 * Math.cos(t * Math.PI))
+            });
+          }
+        }
+        return pts;
+      };
+
+      return [
+        {
+          id: 'boxhill',
+          name: 'Surrey Hills: Box Hill & Leith Hill',
+          rawPoints: makeTrack([
+            [51.2470, -0.3210, 52], [51.2545, -0.3088, 172], [51.2240, -0.3950, 212],
+            [51.1765, -0.3705, 294], [51.2470, -0.3210, 52]
+          ])
+        },
+        {
+          id: 'alpe',
+          name: "Alpe d'Huez & Sarenne Loop",
+          rawPoints: makeTrack([
+            [45.0528, 6.0298, 720], [45.0652, 6.0381, 845], [45.0768, 6.0505, 1140],
+            [45.0860, 6.0630, 1490], [45.0922, 6.0704, 1850], [45.0850, 6.1260, 1999],
+            [45.0435, 6.1180, 1180], [45.0528, 6.0298, 722]
+          ])
+        },
+        {
+          id: 'stelvio',
+          name: 'Passo dello Stelvio (Queen Stage)',
+          rawPoints: makeTrack([
+            [46.4682, 10.3720, 1225], [46.5020, 10.4150, 1790], [46.5220, 10.4450, 2420],
+            [46.5286, 10.4534, 2758], [46.5550, 10.5120, 1840], [46.6170, 10.5880, 915],
+            [46.5440, 10.4890, 2190], [46.5286, 10.4534, 2758]
+          ])
+        }
+      ];
+    }
+
+    function App() {
+      const [rawRoutes, setRawRoutes] = useState(() => createPreloadedRoutes());
+      const [activeId, setActiveId] = useState('boxhill');
+      const [drawerOpen, setDrawerOpen] = useState(true);
+      const [showPhysics, setShowPhysics] = useState(false);
+      const [is3D, setIs3D] = useState(false);
+      const [tileKey, setTileKey] = useState('terrain');
+      const [hoverIdx, setHoverIdx] = useState(null);
+      const [rider, setRider] = useState({ riderWeight: 74, bikeWeight: 8.2, ftp: 260, cda: 0.31, crr: 0.004 });
+      const [isStorageReady, setIsStorageReady] = useState(false);
+
+      const mapContainerRef = useRef(null);
+      const mapRef = useRef(null);
+      const tileLayerRef = useRef(null);
+      const routeLayerGroupRef = useRef(null);
+      const puckRef = useRef(null);
+      const fileInputRef = useRef(null);
+
+      // Load saved routes & rider physics on startup
+      useEffect(() => {
+        loadStateFromStorage().then(({ routes: savedRoutes, prefs }) => {
+          if (savedRoutes && savedRoutes.length > 0) setRawRoutes(savedRoutes);
+          if (prefs?.rider) setRider(prefs.rider);
+          if (prefs?.activeId) setActiveId(prefs.activeId);
+          if (prefs?.tileKey) setTileKey(prefs.tileKey);
+          setIsStorageReady(true);
+        });
+      }, []);
+
+      // Automatically persist changes whenever routes or physics change
+      useEffect(() => {
+        if (!isStorageReady) return;
+        saveStateToStorage(rawRoutes, rider, activeId, tileKey);
+      }, [rawRoutes, rider, activeId, tileKey, isStorageReady]);
+
+      const routes = useMemo(() => rawRoutes.map(r => analyzeRoute(r.id, r.name, r.rawPoints, rider)).filter(Boolean), [rawRoutes, rider]);
+      const activeRoute = useMemo(() => routes.find(r => r.id === activeId) || routes[0], [routes, activeId]);
+
+      useEffect(() => {
+        if (!mapContainerRef.current || mapRef.current || !window.L) return;
+
+        const L = window.L;
+        const map = L.map(mapContainerRef.current, {
+          center: [51.22, -0.33],
+          zoom: 12,
+          zoomControl: false,
+          attributionControl: false
+        });
+
+        tileLayerRef.current = L.tileLayer(TILE_SOURCES[tileKey].url, { maxZoom: 20 }).addTo(map);
+        routeLayerGroupRef.current = L.layerGroup().addTo(map);
+        mapRef.current = map;
+
+        setTimeout(() => {
+          map.invalidateSize();
+          drawRoutesOnLeaflet();
+          if (activeRoute) {
+            map.fitBounds(activeRoute.bounds, {
+              paddingTopLeft: [25, 145],
+              paddingBottomRight: [25, 220]
+            });
+          }
+        }, 150);
+      }, []);
+
+      const cycleMapStyle = () => {
+        const order = ['terrain', 'roads', 'sat', 'topo'];
+        const nextKey = order[(order.indexOf(tileKey) + 1) % order.length];
+        setTileKey(nextKey);
+        if (tileLayerRef.current && TILE_SOURCES[nextKey]) {
+          tileLayerRef.current.setUrl(TILE_SOURCES[nextKey].url);
+        }
+      };
+
+      const drawRoutesOnLeaflet = () => {
+        const map = mapRef.current;
+        const group = routeLayerGroupRef.current;
+        const L = window.L;
+        if (!map || !group || !L) return;
+
+        group.clearLayers();
+
+        routes.forEach(r => {
+          if (activeRoute && r.id === activeRoute.id) return;
+          const latlngs = r.points.map(p => [p.lat, p.lon]);
+          const poly = L.polyline(latlngs, { color: r.toughnessColor, weight: 3.5, opacity: 0.7 });
+          poly.on('click', () => setActiveId(r.id));
+          poly.addTo(group);
+        });
+
+        if (activeRoute) {
+          const allLatLngs = activeRoute.points.map(p => [p.lat, p.lon]);
+          L.polyline(allLatLngs, { color: '#090D16', weight: 9, opacity: 0.85 }).addTo(group);
+
+          for (let i = 0; i < activeRoute.points.length - 1; i++) {
+            const p1 = activeRoute.points[i];
+            const p2 = activeRoute.points[i + 1];
+            L.polyline([[p1.lat, p1.lon], [p2.lat, p2.lon]], {
+              color: getGradeColor(p2.grade), weight: 5.5, opacity: 1, lineCap: 'round'
+            }).addTo(group);
+          }
+
+          const sPt = activeRoute.points[0];
+          const startIcon = L.divIcon({
+            className: '',
+            html: `<div style="background:#10B981;color:#090D16;font-weight:900;font-size:9px;padding:2px 6px;border-radius:99px;border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,0.5);white-space:nowrap;">START</div>`,
+            iconSize: [44, 18], iconAnchor: [22, 9]
+          });
+          L.marker([sPt.lat, sPt.lon], { icon: startIcon }).addTo(group);
+
+          activeRoute.climbs.forEach(c => {
+            const climbIcon = L.divIcon({
+              className: '',
+              html: `<div style="background:#E11D48;color:#fff;font-weight:900;font-size:10px;padding:2px 6px;border-radius:6px;border:1.5px solid #fff;box-shadow:0 3px 8px rgba(0,0,0,0.5);white-space:nowrap;">${c.category} • ${c.avgGrade}%</div>`,
+              iconSize: [68, 20], iconAnchor: [34, 10]
+            });
+            L.marker([c.summitLat, c.summitLon], { icon: climbIcon }).addTo(group);
+          });
+        }
+      };
+
+      useEffect(() => {
+        const map = mapRef.current;
+        if (!map) return;
+        map.invalidateSize();
+        drawRoutesOnLeaflet();
+        if (activeRoute) {
+          map.fitBounds(activeRoute.bounds, {
+            paddingTopLeft: [25, drawerOpen ? 145 : 70],
+            paddingBottomRight: [25, 220],
+            animate: true
+          });
+        }
+      }, [routes, activeRoute]);
+
+      useEffect(() => {
+        const map = mapRef.current;
+        const L = window.L;
+        if (!map || !L) return;
+
+        if (hoverIdx === null || !activeRoute?.points[hoverIdx]) {
+          if (puckRef.current) { puckRef.current.remove(); puckRef.current = null; }
+          return;
+        }
+
+        const pt = activeRoute.points[hoverIdx];
+        if (!puckRef.current) {
+          puckRef.current = L.circleMarker([pt.lat, pt.lon], {
+            radius: 8, fillColor: '#22d3ee', color: '#ffffff', weight: 2.5, fillOpacity: 1
+          }).addTo(map);
+        } else {
+          puckRef.current.setLatLng([pt.lat, pt.lon]);
+        }
+      }, [hoverIdx, activeRoute]);
+
+      // Supports both .gpx files AND .json VeloLab Library Backup files
+      const onUploadGpx = async (e) => {
+        const files = Array.from(e.target.files || []);
+        if (!files.length) return;
+        const added = [];
+
+        for (const f of files) {
+          const lower = f.name.toLowerCase();
+          if (lower.endsWith('.json')) {
+            try {
+              const backup = JSON.parse(await f.text());
+              if (backup.rawRoutes) setRawRoutes(backup.rawRoutes);
+              if (backup.rider) setRider(backup.rider);
+              if (backup.activeId) setActiveId(backup.activeId);
+              return;
+            } catch (err) {}
+          } else if (lower.endsWith('.gpx')) {
+            const txt = await f.text();
+            const xml = new DOMParser().parseFromString(txt, 'text/xml');
+            const name = xml.querySelector('trk > name, rte > name')?.textContent || f.name.replace(/\.gpx$/i, '');
+            const nodes = Array.from(xml.querySelectorAll('trkpt, rtept'));
+            const stride = nodes.length > 900 ? Math.ceil(nodes.length / 900) : 1;
+            const pts = [];
+            for (let i = 0; i < nodes.length; i += stride) {
+              const lat = parseFloat(nodes[i].getAttribute('lat'));
+              const lon = parseFloat(nodes[i].getAttribute('lon'));
+              const ele = parseFloat(nodes[i].querySelector('ele')?.textContent || '0');
+              if (!isNaN(lat) && !isNaN(lon)) pts.push({ lat, lon, ele });
+            }
+            if (pts.length > 1) added.push({ id: `gpx-${Date.now()}-${Math.random()}`, name, rawPoints: pts });
+          }
+        }
+        if (added.length) {
+          setRawRoutes(prev => [...added, ...prev]);
+          setActiveId(added[0].id);
+        }
+      };
+
+      // Export entire library + rider settings as a single 1-tap JSON file (for data: URL users)
+      const exportLibraryBackup = () => {
+        const payload = JSON.stringify({ rawRoutes, rider, activeId }, null, 2);
+        const blob = new Blob([payload], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `VeloLab-Library-${rawRoutes.length}-Routes.json`;
+        a.click();
+      };
+
+      const hoverPt = activeRoute && hoverIdx !== null ? activeRoute.points[hoverIdx] : null;
+      const wKg = (rider.ftp / rider.riderWeight).toFixed(2);
+
+      return (
+        <div className="relative w-full h-full overflow-hidden">
+          <div id="map-wrapper">
+            <div id="map-canvas" ref={mapContainerRef} className={is3D ? 'map-tilted' : ''} />
+          </div>
+
+          <input ref={fileInputRef} type="file" accept=".gpx,.json,*/*" multiple className="hidden" onChange={onUploadGpx} />
+
+          {/* TOP BAR FOR IPHONE */}
+          <div className="absolute safe-top left-3 right-3 z-20 flex items-center justify-between gap-1.5 pointer-events-none">
+            <div className="flex items-center gap-1.5 pointer-events-auto">
+              <button
+                onClick={() => setDrawerOpen(!drawerOpen)}
+                className="px-2.5 py-2 rounded-xl bg-slate-950/90 backdrop-blur-md border border-slate-700 text-xs font-black text-cyan-400 shadow-lg active:scale-95 transition"
+              >
+                VeloLab ({routes.length})
+              </button>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="px-2.5 py-2 rounded-xl bg-cyan-500 text-slate-950 font-black text-xs shadow-lg active:scale-95 transition"
+              >
+                + GPX
+              </button>
+              <button
+                onClick={exportLibraryBackup}
+                title="Save Library Snapshot to iPhone Files"
+                className="px-2 py-2 rounded-xl bg-slate-950/90 border border-slate-700 text-xs font-bold text-slate-200 shadow-lg active:scale-95 transition"
+              >
+                💾
+              </button>
+            </div>
+
+            <div className="flex items-center gap-1.5 pointer-events-auto">
+              <button
+                onClick={cycleMapStyle}
+                className="px-2.5 py-2 rounded-xl bg-slate-950/90 border border-emerald-500/60 text-xs font-black text-emerald-400 shadow-lg active:scale-95 transition"
+              >
+                {TILE_SOURCES[tileKey].label}
+              </button>
+              <button
+                onClick={() => setIs3D(!is3D)}
+                className={`px-2 py-2 rounded-xl text-xs font-bold border active:scale-95 transition ${
+                  is3D ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-950/90 border-slate-700 text-slate-300'
+                }`}
+              >
+                {is3D ? '3D' : '2D'}
+              </button>
+              <button
+                onClick={() => setShowPhysics(true)}
+                className="px-2.5 py-2 rounded-xl bg-slate-950/90 border border-amber-500/60 text-xs font-black text-amber-400 active:scale-95 transition"
+              >
+                ⚡{rider.ftp}W
+              </button>
+            </div>
+          </div>
+
+          {/* HORIZONTAL ROUTE SELECTOR PILLS */}
+          {drawerOpen && (
+            <div className="absolute top-16 left-3 right-3 z-20 flex gap-2 overflow-x-auto pb-1">
+              {routes.map(r => (
+                <div
+                  key={r.id}
+                  onClick={() => setActiveId(r.id)}
+                  className={`shrink-0 w-64 p-2.5 rounded-2xl backdrop-blur-xl border transition cursor-pointer ${
+                    activeRoute?.id === r.id ? 'bg-slate-950/95 border-cyan-400 shadow-xl' : 'bg-slate-950/85 border-slate-800'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-xs font-bold text-white truncate">{r.name}</span>
+                    <span
+                      className="px-1.5 py-0.5 rounded text-[10px] font-black text-slate-950 shrink-0"
+                      style={{ backgroundColor: r.toughnessColor }}
+                    >
+                      {r.toughnessScore.toFixed(1)}/10
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] text-slate-300 mt-1.5">
+                    <span>{r.distKm} km</span>
+                    <span className="text-emerald-400 font-bold">{r.gainM}m ↑</span>
+                    <span className="text-cyan-300 font-bold">{formatTime(r.movingTimeSec)}</span>
+                    <span className="text-amber-400 font-bold">{r.avgSpeedKmh} km/h</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* BOTTOM ELEVATION PROFILE + FULL NEWTON-RAPHSON TELEMETRY SHEET */}
+          {activeRoute && (
+            <div className="absolute safe-bottom left-3 right-3 h-52 z-20 bg-slate-950/95 backdrop-blur-xl border border-slate-800 rounded-2xl p-3 flex flex-col justify-between shadow-2xl">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="font-black text-white truncate max-w-[140px]">{activeRoute.name}</span>
+                {hoverPt ? (
+                  <div className="flex items-center gap-2 font-black bg-cyan-950/90 border border-cyan-500/40 px-2 py-0.5 rounded-lg">
+                    <span className="text-cyan-300">{hoverPt.distKm.toFixed(1)}km</span>
+                    <span className="text-white">{hoverPt.ele}m</span>
+                    <span style={{ color: getGradeColor(hoverPt.grade) }}>{hoverPt.grade}%</span>
+                    <span className="text-emerald-400">{hoverPt.speedKmh}km/h</span>
+                    <span className="text-amber-400">{hoverPt.powerW}W</span>
+                  </div>
+                ) : (
+                  <span className="text-slate-400 font-semibold">
+                    Max {activeRoute.maxEle}m • Steepest {activeRoute.maxGrade}%
+                  </span>
+                )}
+              </div>
+
+              <div className="grid grid-cols-5 gap-1 bg-slate-900/90 border border-slate-800 rounded-xl px-2 py-1 text-center my-0.5">
+                <div>
+                  <div className="text-[9px] text-slate-400 uppercase">Est Time</div>
+                  <div className="text-[11px] font-black text-cyan-300">{formatTime(activeRoute.movingTimeSec)}</div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-slate-400 uppercase">Avg Spd</div>
+                  <div className="text-[11px] font-black text-emerald-400">{activeRoute.avgSpeedKmh} km/h</div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-slate-400 uppercase">Norm Pwr</div>
+                  <div className="text-[11px] font-black text-amber-400">{activeRoute.np} W</div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-slate-400 uppercase">Load / Work</div>
+                  <div className="text-[11px] font-black text-rose-400">{activeRoute.tss} TSS • {activeRoute.kj}kJ</div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-slate-400 uppercase">Min Gear</div>
+                  <div className="text-[11px] font-black text-purple-300">{activeRoute.minGear}</div>
+                </div>
+              </div>
+
+              <div
+                className="relative flex-1 w-full my-0.5"
+                onTouchMove={e => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const ratio = Math.max(0, Math.min(1, (e.touches[0].clientX - rect.left) / rect.width));
+                  setHoverIdx(Math.floor(ratio * (activeRoute.points.length - 1)));
+                }}
+                onTouchEnd={() => setHoverIdx(null)}
+                onMouseMove={e => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                  setHoverIdx(Math.floor(ratio * (activeRoute.points.length - 1)));
+                }}
+                onMouseLeave={() => setHoverIdx(null)}
+              >
+                <svg viewBox="0 0 1000 110" preserveAspectRatio="none" className="w-full h-full">
+                  {activeRoute.points.map((pt, i) => {
+                    if (i === 0) return null;
+                    const prev = activeRoute.points[i - 1];
+                    const n = activeRoute.points.length - 1;
+                    const x1 = ((i - 1) / n) * 1000, x2 = (i / n) * 1000;
+                    const span = Math.max(80, activeRoute.maxEle - activeRoute.minEle);
+                    const y1 = 104 - ((prev.ele - activeRoute.minEle) / span) * 92;
+                    const y2 = 104 - ((pt.ele - activeRoute.minEle) / span) * 92;
+                    const c = getGradeColor(pt.grade);
+                    return (
+                      <g key={i}>
+                        <polygon points={`${x1},108 ${x1},${y1} ${x2},${y2} ${x2},108`} fill={c} fillOpacity="0.35" />
+                        <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={c} strokeWidth="2.5" />
+                      </g>
+                    );
+                  })}
+                  {hoverIdx !== null && (
+                    <line
+                      x1={(hoverIdx / (activeRoute.points.length - 1)) * 1000}
+                      y1="0"
+                      x2={(hoverIdx / (activeRoute.points.length - 1)) * 1000}
+                      y2="108"
+                      stroke="#22d3ee"
+                      strokeWidth="3"
+                    />
+                  )}
+                </svg>
+              </div>
+
+              <div className="flex gap-1.5 overflow-x-auto">
+                {activeRoute.climbs.length > 0 ? (
+                  activeRoute.climbs.map(c => (
+                    <button
+                      key={c.id}
+                      onClick={() => mapRef.current?.setView([c.summitLat, c.summitLon], 15, { animate: true })}
+                      className="px-2 py-0.5 rounded bg-rose-500/20 border border-rose-500/40 text-rose-300 text-[10px] font-bold shrink-0"
+                    >
+                      {c.category}: {c.lengthKm}km @ {c.avgGrade}% (FIETS {c.fiets})
+                    </button>
+                  ))
+                ) : (
+                  <span className="text-[10px] text-slate-500">Drag finger across graph to inspect live speed, grade & watts</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* EXPANDED NEWTON-RAPHSON RIDER PHYSICS MODAL */}
+          {showPhysics && (
+            <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm p-4 space-y-3.5 shadow-2xl">
+                <div className="flex justify-between items-center">
+                  <div>
+                    <div className="text-sm font-black text-white">Newton-Raphson Physics Solver</div>
+                    <div className="text-[10px] text-cyan-400 font-bold">Power-to-Weight: {wKg} W/kg</div>
+                  </div>
+                  <button onClick={() => setShowPhysics(false)} className="px-3 py-1.5 rounded-xl bg-cyan-500 text-slate-950 text-xs font-black">Done</button>
+                </div>
+
+                <div className="space-y-2.5 text-xs">
+                  <div>
+                    <div className="flex justify-between mb-0.5">
+                      <span className="text-slate-300">Functional Threshold Power (FTP)</span>
+                      <span className="text-amber-400 font-black">{rider.ftp} W</span>
+                    </div>
+                    <input type="range" min="120" max="450" value={rider.ftp} onChange={e => setRider({ ...rider, ftp: Number(e.target.value) })} className="w-full accent-amber-400" />
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between mb-0.5">
+                      <span className="text-slate-300">Rider Weight</span>
+                      <span className="text-white font-black">{rider.riderWeight} kg</span>
+                    </div>
+                    <input type="range" min="45" max="115" value={rider.riderWeight} onChange={e => setRider({ ...rider, riderWeight: Number(e.target.value) })} className="w-full accent-cyan-400" />
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between mb-0.5">
+                      <span className="text-slate-300">Bike + Kit Weight</span>
+                      <span className="text-white font-black">{rider.bikeWeight} kg</span>
+                    </div>
+                    <input type="range" min="6.8" max="16" step="0.2" value={rider.bikeWeight} onChange={e => setRider({ ...rider, bikeWeight: Number(e.target.value) })} className="w-full accent-cyan-400" />
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between mb-0.5">
+                      <span className="text-slate-300">Aero Drag Area (CdA)</span>
+                      <span className="text-emerald-400 font-black">{rider.cda} m²</span>
+                    </div>
+                    <input type="range" min="0.24" max="0.42" step="0.01" value={rider.cda} onChange={e => setRider({ ...rider, cda: Number(e.target.value) })} className="w-full accent-emerald-400" />
+                  </div>
+                </div>
+
+                {activeRoute && (
+                  <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                    <div className="text-[10px] font-bold text-slate-400 uppercase truncate">
+                      Solved Output: {activeRoute.name}
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 text-center">
+                      <div className="bg-slate-900 p-1.5 rounded-lg">
+                        <div className="text-[9px] text-slate-400">Moving Time</div>
+                        <div className="text-xs font-black text-cyan-300">{formatTime(activeRoute.movingTimeSec)}</div>
+                      </div>
+                      <div className="bg-slate-900 p-1.5 rounded-lg">
+                        <div className="text-[9px] text-slate-400">Avg Speed</div>
+                        <div className="text-xs font-black text-emerald-400">{activeRoute.avgSpeedKmh} km/h</div>
+                      </div>
+                      <div className="bg-slate-900 p-1.5 rounded-lg">
+                        <div className="text-[9px] text-slate-400">Norm Power</div>
+                        <div className="text-xs font-black text-amber-400">{activeRoute.np} W (IF {activeRoute.intensityFactor})</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
